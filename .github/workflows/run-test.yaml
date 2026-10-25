@@ -1,20 +1,21 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector forwarded to tox posargs"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2022-11-15T14:37:53.675556Z@time-machines-pypi.sealsecurity.io/
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -41,17 +42,56 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v2
 
+      - name: Set up x64 CPython 3.7 from conda-forge (runs under Rosetta 2)
+        # arm64 macOS has no CPython 3.7 build (built from source it lacks
+        # _ctypes) and the python-versions darwin-x64 one needs Intel Homebrew
+        # libraries, which Homebrew no longer installs
+        if: runner.os == 'macOS' && matrix.python-version == '3.7'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/miniforge.sh" https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh
+          arch -x86_64 bash "$RUNNER_TEMP/miniforge.sh" -b -p "$RUNNER_TEMP/miniforge"
+          arch -x86_64 "$RUNNER_TEMP/miniforge/bin/conda" create -y -p "$RUNNER_TEMP/py37" -c conda-forge python=3.7 pip
+          echo "$RUNNER_TEMP/py37/bin" >> "$GITHUB_PATH"
+
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: ${{ !(runner.os == 'macOS' && matrix.python-version == '3.7') }}
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tox setuptools
-          pip list
+          python -m pip install --upgrade tox "setuptools==65.5.1"
+          python -m pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        # mirrors the 1.2.4 release: HTML docs built into doc/ (shipped in the
+        # sdist), sdist made with setuptools<60, wheel with setuptools>=62
+        run: |
+          git clean -xdfq
+          sed -i '/tag_build = dev/d' setup.cfg
+          python -m pip install "build==0.9.0" "setuptools==59.6.0" "wheel==0.38.4"
+          python -m pip install --no-build-isolation "sphinx==5.3.0" \
+            "git+https://github.com/sqlalchemyorg/zzzeeksphinx.git@4ce5455e281bf27e9609af6f12358fe680dc193d" \
+            "git+https://github.com/sqlalchemyorg/changelog.git@66e3e124386550e1d6c5c1b3a7a88b9d3dc2046a" \
+            "git+https://github.com/sqlalchemyorg/sphinx-paramlinks.git@31220524adf33128860806f9c19c06f9f28fa04e"
+          make -C doc/build dist-html
+          python -m build --sdist --no-isolation
+          python -m pip install "setuptools==65.5.1"
+          python -m build --wheel --no-isolation
+
+      - name: Upload distributions
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
